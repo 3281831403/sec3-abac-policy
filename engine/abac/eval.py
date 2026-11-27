@@ -45,9 +45,11 @@ def _as_collection(value):
 
 
 def _normalise_value(value):
-    """Return a stable representation for a policy literal."""
-    if isinstance(value, (int, float)) and not isinstance(value, bool):
-        return str(value)
+    """Preserve a policy literal's native type.
+
+    Retained as a compatibility shim for callers of the old private helper;
+    literals must never be coerced to strings before type-aware comparison.
+    """
     return value
 
 
@@ -65,6 +67,8 @@ def _parse_condition(condition):
     return {
         "attr": condition.get("attr"),
         "op": condition.get("op", "eq"),
+        # Literals keep their declared type: numbers must stay numbers so
+        # comparisons never degrade into string comparison.
         "value": _normalise_value(condition.get("value")),
     }
 
@@ -117,18 +121,25 @@ def _missing_required(context, policy):
 
 
 def _values_equal(left, right):
+    """Equality by actual type, never by string coercion."""
+    # Numbers compare numerically; booleans are deliberately excluded.
     if _is_number(left) and _is_number(right):
         return left == right
-    if isinstance(left, str) and isinstance(right, str):
-        return left.startswith(right)
-    if isinstance(left, (list, tuple, set, frozenset)):
-        return False
-    if isinstance(right, (list, tuple, set, frozenset)):
-        return False
+    # Collections are equal only when their types match and they hold the
+    # same members (members themselves compared by type-aware equality).
+    if _as_collection(left) is not None or _as_collection(right) is not None:
+        if type(left) is not type(right):
+            return False
+        if len(left) != len(right):
+            return False
+        return all(_contains(left, item) for item in right)
+    # Everything else requires an identical type and value.  Strings use
+    # exact equality here; prefix matching is the job of the "prefix" op.
     return type(left) is type(right) and left == right
 
 
 def _contains(container, item):
+    """Membership test for collection attributes."""
     values = _as_collection(container)
     if values is None:
         return False
@@ -144,21 +155,19 @@ def compare(op, left, right) -> bool:
     if op == "ne":
         return not _values_equal(left, right)
     if op == "in":
+        # left is a member of the right-hand collection.
         return _contains(right, left)
     if op == "not_in":
         return not _contains(right, left)
     if op == "has":
-        return str(right) in str(left)
+        # Collection attribute judged by exact member, not substring.
+        return _contains(left, right)
     if op == "has_any":
         left_values = _as_collection(left)
         right_values = _as_collection(right)
         if left_values is None or right_values is None:
             return False
-        return any(
-            _values_equal(left_item, right_item)
-            for left_item in left_values
-            for right_item in right_values
-        )
+        return any(_contains(left_values, item) for item in right_values)
     if op == "prefix":
         return (
             isinstance(left, str)
@@ -166,38 +175,71 @@ def compare(op, left, right) -> bool:
             and left.startswith(right)
         )
     if op in _ORDER_OPS:
+        # Ordering is numeric; type mismatches simply do not hold.
         if not (_is_number(left) and _is_number(right)):
             return False
-        left_text = str(left)
-        right_text = str(right)
         if op == "gt":
-            return left_text > right_text
+            return left > right
         if op == "gte":
-            return left_text >= right_text
+            return left >= right
         if op == "lt":
-            return left_text < right_text
-        return left_text <= right_text
-    return True
+            return left < right
+        return left <= right
+    # Unknown operators never match.
+    return False
 
 
-def eval_condition(cond, ctx) -> bool:
-    """Evaluate a condition against a request context."""
+def _eval_condition(cond, ctx):
+    """Evaluate a condition.
+
+    Returns True/False, or the MISSING sentinel whenever an evaluated
+    attribute is absent.  ``all``/``any`` short-circuit like the Python
+    boolean operators, so branches past the deciding value are not
+    evaluated and cannot contribute a missing-attribute result.
+    """
     if cond is None:
         return True
     if not isinstance(cond, Mapping):
         return False
     if "all" in cond:
-        values = [eval_condition(item, ctx) for item in cond["all"]]
-        return all(values)
+        for item in cond["all"]:
+            result = _eval_condition(item, ctx)
+            if result is MISSING:
+                return MISSING
+            if not result:
+                return False
+        return True
     if "any" in cond:
-        values = [eval_condition(item, ctx) for item in cond["any"]]
-        return any(values)
+        for item in cond["any"]:
+            result = _eval_condition(item, ctx)
+            if result is MISSING:
+                return MISSING
+            if result:
+                return True
+        return False
     if "not" in cond:
-        return not eval_condition(cond["not"], ctx)
+        result = _eval_condition(cond["not"], ctx)
+        if result is MISSING:
+            # A missing attribute stays a denial under negation.
+            return MISSING
+        return not result
+
     left = resolve_attr(ctx, cond.get("attr"))
     if left is MISSING:
-        left = ""
-    return compare(cond.get("op", "eq"), left, cond.get("value"))
+        return MISSING
+    return bool(compare(cond.get("op", "eq"), left, cond.get("value")))
+
+
+def eval_condition(cond, ctx) -> bool:
+    """Evaluate a condition against a request context.
+
+    Any evaluated attribute that is missing makes the condition fail
+    closed rather than being coerced into an empty value.
+    """
+    result = _eval_condition(cond, ctx)
+    if result is MISSING:
+        return False
+    return bool(result)
 
 
 def eval_rule(rule, ctx) -> str:
@@ -220,14 +262,14 @@ def combine(results, policy) -> str:
     )
     applicable = [item for item in results if item in ("allow", "deny")]
     if not applicable:
-        return "allow"
-    if mode == "allow_overrides":
-        if "allow" in applicable:
-            return "allow"
+        # Nothing applies: fail closed.
         return "deny"
+    if mode == "allow_overrides":
+        return "allow" if "allow" in applicable else "deny"
     if mode == "first_applicable":
         return applicable[0]
-    return applicable[0]
+    # deny_overrides (and any unrecognised mode) defaults to denying.
+    return "deny" if "deny" in applicable else "allow"
 
 
 def _iter_atomic_conditions(condition):
@@ -275,21 +317,25 @@ def validate_policy(policy) -> list[str]:
 
 
 def abac_batch(requests, policy) -> dict:
-    """Evaluate a sequence of requests and return one decision per request."""
+    """Evaluate a sequence of requests and return one decision per request.
+
+    Every request is evaluated against its own context: no attribute is
+    carried over between requests, and evaluation is deterministic, so the
+    same request repeated yields the same decision.
+    """
     parsed = parse_policy(policy)
     decisions = []
-    context = {}
     for index, request in enumerate(requests):
         if isinstance(request, Mapping):
             request_context = request.get("context")
             if not isinstance(request_context, Mapping):
                 request_context = request
-            context.update(request_context)
             request_id = request.get("id", index)
         else:
+            request_context = {}
             request_id = index
-        missing_required = _missing_required(context, parsed)
-        results = [eval_rule(rule, context) for rule in parsed["rules"]]
+        missing_required = _missing_required(request_context, parsed)
+        results = [eval_rule(rule, request_context) for rule in parsed["rules"]]
         outcome = "deny" if missing_required else combine(results, parsed)
         decisions.append(
             {
